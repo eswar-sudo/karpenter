@@ -1,0 +1,366 @@
+This guide walks through setting up IAM roles, resource tagging, and deploying Karpenter for automated node provisioning in your Amazon EKS cluster.
+
+Prerequisites: Set Environment Variables
+
+a) EKS Cluster
+
+b) Nodegroup
+
+ 
+
+To get started with setup we first need to create two new IAM roles for nodes provisioned with Karpenter and the Karpenter controller.
+
+Create IAM Roles
+
+ Karpenter Node Role
+
+Create trust policy:
+
+vi node-trust-policy.json
+
+
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "ec2.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+ 
+
+Create role:
+
+
+
+aws iam create-role --role-name "KarpenterNodeRole-<cluster-name>" \
+    --assume-role-policy-document file://node-trust-policy.json
+Attach required policies:
+
+
+
+aws iam attach-role-policy --role-name "KarpenterNodeRole-<cluster-name>" \
+    --policy-arn "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+aws iam attach-role-policy --role-name "KarpenterNodeRole-<cluster-name>" \
+    --policy-arn "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+aws iam attach-role-policy --role-name "KarpenterNodeRole-<cluster-name>" \
+    --policy-arn "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+aws iam attach-role-policy --role-name "KarpenterNodeRole-<cluster-name>" \
+    --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+ Replace <cluster-name> as per your setup.
+
+ 
+
+ Karpenter Controller Role
+
+Create trust policy file (controller-trust-policy.json)
+
+
+vi controller-trust-policy.json
+
+
+
+{
+ "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::<Account_ID>:oidc-provider/${OIDC_ENDPOINT#*//}"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "${OIDC_ENDPOINT#*//}:aud": "sts.amazonaws.com",
+                    "${OIDC_ENDPOINT#*//}:sub": "system:serviceaccount:<karpenter-namespace>:karpenter"
+                }
+            }
+        }
+    ]
+}
+ 
+
+Create Controller role
+
+
+
+aws iam create-role --role-name "KarpenterControllerRole-<cluster-name>" \
+    --assume-role-policy-document file://controller-trust-policy.json
+ 
+
+Create controller-policy.json
+
+vi controller-policy.json
+
+
+
+{
+    "Statement": [
+        {
+            "Action": [
+                "ssm:GetParameter",
+                "ec2:DescribeImages",
+                "ec2:RunInstances",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeLaunchTemplates",
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceTypes",
+                "ec2:DescribeInstanceTypeOfferings",
+                "ec2:DeleteLaunchTemplate",
+                "ec2:CreateTags",
+                "ec2:CreateLaunchTemplate",
+                "ec2:CreateFleet",
+                "ec2:DescribeSpotPriceHistory",
+                "pricing:GetProducts"
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "Karpenter"
+        },
+        {
+            "Action": "ec2:TerminateInstances",
+            "Condition": {
+                "StringLike": {
+                    "ec2:ResourceTag/karpenter.sh/nodepool": "*"
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "ConditionalEC2Termination"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": "<KarpenterNode-Role-arn>",
+            "Sid": "PassNodeIAMRole"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "eks:DescribeCluster",
+            "Resource": "arn:aws:eks:<cluster-region>:<Account_ID>:cluster/<cluster-name>",
+            "Sid": "EKSClusterEndpointLookup"
+        },
+        {
+            "Sid": "AllowScopedInstanceProfileCreationActions",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Action": [
+            "iam:CreateInstanceProfile"
+            ],
+            "Condition": {
+            "StringEquals": {
+                "aws:RequestTag/kubernetes.io/cluster/<cluster-name>": "owned",
+                "aws:RequestTag/topology.kubernetes.io/region": "<cluster-region>"
+            },
+            "StringLike": {
+                "aws:RequestTag/karpenter.k8s.aws/ec2nodeclass": "*"
+            }
+            }
+        },
+        {
+            "Sid": "AllowScopedInstanceProfileTagActions",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Action": [
+            "iam:TagInstanceProfile"
+            ],
+            "Condition": {
+            "StringEquals": {
+                "aws:ResourceTag/kubernetes.io/cluster/<cluster-name>": "owned",
+                "aws:ResourceTag/topology.kubernetes.io/region": "<cluster-region>",
+                "aws:RequestTag/kubernetes.io/cluster/${CLUSTER_NAME}": "owned",
+                "aws:RequestTag/topology.kubernetes.io/region": "<cluster-region>"
+            },
+            "StringLike": {
+                "aws:ResourceTag/karpenter.k8s.aws/ec2nodeclass": "*",
+                "aws:RequestTag/karpenter.k8s.aws/ec2nodeclass": "*"
+            }
+            }
+        },
+        {
+            "Sid": "AllowScopedInstanceProfileActions",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Action": [
+            "iam:AddRoleToInstanceProfile",
+            "iam:RemoveRoleFromInstanceProfile",
+            "iam:DeleteInstanceProfile"
+            ],
+            "Condition": {
+            "StringEquals": {
+                "aws:ResourceTag/kubernetes.io/cluster/<cluster-name>": "owned",
+                "aws:ResourceTag/topology.kubernetes.io/region": "<cluster-region>"
+            },
+            "StringLike": {
+                "aws:ResourceTag/karpenter.k8s.aws/ec2nodeclass": "*"
+            }
+            }
+        },
+        {
+            "Sid": "AllowInstanceProfileReadActions",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Action": "iam:GetInstanceProfile"
+        }
+    ],
+    "Version": "2012-10-17"
+}
+Attach this policy to KarpenterControllerRole
+
+
+
+aws iam put-role-policy --role-name "KarpenterControllerRole-<cluster-name>" \
+    --policy-name "KarpenterControllerPolicy-<cluster-name>" \
+    --policy-document file://controller-policy.json
+ 
+
+Create and Annotate Service Account
+
+
+
+
+kubectl create serviceaccount karpenter -n karpenter
+kubectl annotate serviceaccount karpenter \
+  -n karpenter \
+  eks.amazonaws.com/role-arn=<Karpenter-controller-role-arn>
+ 
+
+ 
+
+Tag Subnets and Security Groups
+
+Tag subnets:
+
+
+
+aws ec2 create-tags \
+--resources <node-subnet-IDs> \
+--tags "Key=karpenter.sh/discovery,Value=<cluster-name>"
+ 
+
+Tag security groups:
+
+
+
+aws ec2 create-tags \
+--resources <node-security-group-ID> \
+--tags "Key=karpenter.sh/discovery,Value=<cluster-name>"
+ 
+
+Update aws-auth ConfigMap
+
+We need to allow nodes that are using the node IAM role we just created to join the cluster. To do that we have to modify the aws-auth ConfigMap in the cluster.
+
+kubectl edit configmap aws-auth -n kube-system
+
+You will need to add a section to the mapRoles that looks something like this.
+
+
+
+- groups:
+  - system:bootstrappers
+  - system:nodes
+  ## If you intend to run Windows workloads, the kube-proxy group should be specified.
+  # For more information, see https://github.com/aws/karpenter/issues/5099.
+  # - eks:kube-proxy-windows
+  rolearn: arn:aws:iam::<Account_ID>:role/KarpenterNodeRole-<cluster-name>
+  username: system:node:{{EC2PrivateDNSName}}
+Replace <Account_ID> variable with your account ID, and <cluster-name> variable with the cluster name.
+
+Install Karpenter with Helm
+
+helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter --version "1.5.2" --namespace "karpenter" --create-namespace \
+  --set "settings.clusterName=<cluster-name>" \
+  --set logLevel=debug \
+  --set installCRDs=true \
+  --set "settings.interruptionQueue=<cluster-name>" \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=karpenter \
+  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=<karpenter-controller-role-arn>" \
+  --set "settings.interruptionQueue=<cluster-name>" \
+  --set controller.resources.requests.cpu=1 \
+  --set controller.resources.requests.memory=1Gi \
+  --set controller.resources.limits.cpu=1 \
+  --set controller.resources.limits.memory=1Gi \
+  --wait
+
+Replace <cluster-name> with your cluster name
+
+kubectl get pods -n karpenter
+
+5. Create default NodePool
+We need to create a default NodePool so Karpenter knows what types of nodes we want for unscheduled workloads. You can refer to some of the example NodePool for specific needs.
+
+vi ec2nodeclass.yaml
+
+ 
+
+
+
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot","on-demand"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["2"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      expireAfter: 720h # 30 * 24h = 720h
+  limits:
+    cpu: 1000
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  role: "KarpenterNodeRole-<cluster-name>" # replace with your cluster name
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - id: <node-ami-id> # replace managed node ami-id
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "<cluster-name>" # replace with your cluster name
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "<cluster-name>" # replace with your cluster name
+ 
+
+kubectl apply -f ec2nodeclass.yaml 
+
+kubectl get ec2nodeclass default 
+
+kubectl get nodepool default
+
+
+ 
+
+ 
